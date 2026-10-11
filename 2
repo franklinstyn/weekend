@@ -1,0 +1,69 @@
+from pathlib import Path
+
+BOT_NAME = "avalon"
+SPIDER_MODULES = ["avalon.spiders"]
+NEWSPIDER_MODULE = "avalon.spiders"
+
+ROBOTSTXT_OBEY = True
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+DEFAULT_REQUEST_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+CONCURRENT_REQUESTS = 8
+CONCURRENT_REQUESTS_PER_DOMAIN = 4
+DOWNLOAD_DELAY = 0.5
+RANDOMIZE_DOWNLOAD_DELAY = True
+
+AUTOTHROTTLE_ENABLED = True
+AUTOTHROTTLE_START_DELAY = 1.0
+AUTOTHROTTLE_MAX_DELAY = 10.0
+AUTOTHROTTLE_TARGET_CONCURRENCY = 2.0
+
+RETRY_ENABLED = True
+RETRY_TIMES = 3
+RETRY_HTTP_CODES = [408, 429, 500, 502, 503, 504, 522, 524]
+
+LOG_LEVEL = "INFO"
+
+ENABLE_JSON = False
+ENABLE_CSV = True
+ENABLE_PARQUET = True
+
+ENABLE_MYSQL_FLAT = False
+ENABLE_MYSQL_RELATIONAL = False
+ENABLE_FILE_TO_MYSQL = False   # needs the CSV/JSON/Parquet output it reads to be on
+
+ITEM_PIPELINES = {
+    "avalon.pipelines.ScrapeDatePipeline": 50,   # always on, must run first
+}
+
+if ENABLE_JSON:
+    ITEM_PIPELINES["avalon.pipelines.JsonPipeline"] = 100
+if ENABLE_CSV:
+    ITEM_PIPELINES["avalon.pipelines.CsvPipeline"] = 200
+if ENABLE_PARQUET:
+    ITEM_PIPELINES["avalon.pipelines.ParquetPipeline"] = 300
+if ENABLE_MYSQL_FLAT:
+    ITEM_PIPELINES["avalon.pipelines.MySQLFlatPipeline"] = 400
+if ENABLE_MYSQL_RELATIONAL:
+    ITEM_PIPELINES["avalon.pipelines.MySQLRelationalPipeline"] = 500
+if ENABLE_FILE_TO_MYSQL:
+    ITEM_PIPELINES["avalon.pipelines.FileToMySQLPipeline"] = 600
+
+EXPORT_DIR = str(Path(__file__).resolve().parents[1] / "output")
+PARQUET_BATCH_SIZE = 500         
+MYSQL_CONNECTION = "mysql+pymysql://user:password@localhost:3306/avalon?charset=utf8mb4"
+
+
+MYSQL_FILE_CONNECTION = None      # None = reuse MYSQL_CONNECTION
+MYSQL_FILE_TABLE_PREFIX = "file_" # e.g. communities -> file_communities
+MYSQL_FILE_FORMAT = "csv"         # csv | json | parquet
+FILE_BATCH_SIZE = 1000            # rows per executemany chunk
