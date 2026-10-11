@@ -1,0 +1,167 @@
+from decimal import Decimal
+from typing import List, Optional
+
+from sqlalchemy import (
+    Float,
+    ForeignKeyConstraint,
+    Integer,
+    Numeric,
+    String,
+    Text,
+)
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class AvalonUnit(Base):
+    __tablename__ = "avalon_units"
+
+    initial_scraped_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+    unit_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    move_in_date: Mapped[str] = mapped_column(String(100), primary_key=True)
+    lease_term_months: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=False
+    )
+
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+    community_id: Mapped[Optional[str]] = mapped_column(String(100))
+    community_name: Mapped[Optional[str]] = mapped_column(String(255))
+    neighborhood: Mapped[Optional[str]] = mapped_column(String(255))
+    address_line1: Mapped[Optional[str]] = mapped_column(String(500))
+    state: Mapped[Optional[str]] = mapped_column(String(100))
+    zip: Mapped[Optional[str]] = mapped_column(String(50))
+    latitude: Mapped[Optional[float]] = mapped_column(Float)
+    longitude: Mapped[Optional[float]] = mapped_column(Float)
+    phone: Mapped[Optional[str]] = mapped_column(String(100))
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    community_description: Mapped[Optional[str]] = mapped_column(Text)
+    community_amenities: Mapped[Optional[str]] = mapped_column(Text)
+    community_url: Mapped[Optional[str]] = mapped_column(Text)
+    community_promotion_ids: Mapped[Optional[str]] = mapped_column(Text)
+    community_promotion_descriptions: Mapped[Optional[str]] = mapped_column(Text)
+
+    unit_name: Mapped[Optional[str]] = mapped_column(String(255))
+    unit_url: Mapped[Optional[str]] = mapped_column(Text)
+    bed: Mapped[Optional[int]] = mapped_column(Integer)
+    bath: Mapped[Optional[float]] = mapped_column(Float)
+    area: Mapped[Optional[float]] = mapped_column(Float)
+    furnish_status: Mapped[Optional[str]] = mapped_column(String(100))
+    furnished_available_date: Mapped[Optional[str]] = mapped_column(String(100))
+    occupant_maximum: Mapped[Optional[int]] = mapped_column(Integer)
+
+    price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    total_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    furnished_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    furnished_total_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+
+    promotion_ids: Mapped[Optional[str]] = mapped_column(Text)
+    promotion_descriptions: Mapped[Optional[str]] = mapped_column(Text)
+
+class Community(Base):
+    __tablename__ = "communities"
+
+    community_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+
+    initial_scraped_date: Mapped[str] = mapped_column(String(10))
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+    community_name: Mapped[Optional[str]] = mapped_column(String(255))
+    neighborhood: Mapped[Optional[str]] = mapped_column(String(255))
+    address_line1: Mapped[Optional[str]] = mapped_column(String(500))
+    state: Mapped[Optional[str]] = mapped_column(String(100))
+    zip: Mapped[Optional[str]] = mapped_column(String(50))
+    latitude: Mapped[Optional[float]] = mapped_column(Float)
+    longitude: Mapped[Optional[float]] = mapped_column(Float)
+    phone: Mapped[Optional[str]] = mapped_column(String(100))
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    community_description: Mapped[Optional[str]] = mapped_column(Text)
+    community_amenities: Mapped[Optional[str]] = mapped_column(Text)
+    community_url: Mapped[Optional[str]] = mapped_column(Text)
+
+    units: Mapped[List["Unit"]] = relationship(back_populates="community")
+
+
+class Unit(Base):
+    __tablename__ = "units"
+
+    unit_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    community_id: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    initial_scraped_date: Mapped[str] = mapped_column(String(10))
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+    unit_name: Mapped[Optional[str]] = mapped_column(String(255))
+    unit_url: Mapped[Optional[str]] = mapped_column(Text)
+    bed: Mapped[Optional[int]] = mapped_column(Integer)
+    bath: Mapped[Optional[float]] = mapped_column(Float)
+    area: Mapped[Optional[float]] = mapped_column(Float)
+    furnish_status: Mapped[Optional[str]] = mapped_column(String(100))
+    furnished_available_date: Mapped[Optional[str]] = mapped_column(String(100))
+    occupant_maximum: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # NOTE: keep foreign keys table-level (not inline ForeignKey on a column) so
+    # the file-to-MySQL pipeline can clone these tables under new names.
+    __table_args__ = (
+        ForeignKeyConstraint(["community_id"], ["communities.community_id"]),
+    )
+
+    community: Mapped["Community"] = relationship(back_populates="units")
+    pricing: Mapped[List["UnitPricing"]] = relationship(back_populates="unit")
+
+
+class UnitPricing(Base):
+    __tablename__ = "unit_pricing"
+
+    unit_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    move_in_date: Mapped[str] = mapped_column(String(100), primary_key=True)
+    lease_term_months: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=False
+    )
+    initial_scraped_date: Mapped[str] = mapped_column(String(10), primary_key=True)
+
+    latest_scraped_date: Mapped[str] = mapped_column(String(10))
+    scrape_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
+    price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    total_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    furnished_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    furnished_total_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    promotion_descriptions: Mapped[Optional[str]] = mapped_column(Text)
+    community_promotion_descriptions: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        ForeignKeyConstraint(["unit_id"], ["units.unit_id"]),
+    )
+
+    unit: Mapped["Unit"] = relationship(back_populates="pricing")
+
+
+PIPELINE_CONFIG = {
+    "dates": {
+        "timestamp_column": "scrape_timestamp",
+        "initial_column": "initial_scraped_date",
+        "latest_column": "latest_scraped_date",
+    },
+    # model used only to give the Parquet file stable column types
+    "export": {"model": AvalonUnit},
+    "flat": {
+        "tables": [
+            {"model": AvalonUnit, "mode": "insert_ignore"},
+        ],
+    },
+    "relational": {
+        "tables": [
+            {"model": Community, "mode": "upsert"},
+            {"model": Unit, "mode": "upsert"},
+            {"model": UnitPricing, "mode": "insert_ignore"},
+        ],
+    },
+}
