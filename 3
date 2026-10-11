@@ -1,0 +1,481 @@
+import csv
+import importlib
+import itertools
+import json
+import logging
+import math
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from scrapy import signals
+from scrapy.exporters import CsvItemExporter, JsonItemExporter
+from sqlalchemy import ForeignKeyConstraint, MetaData, Table, create_engine, func
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+logger = logging.getLogger(__name__)
+
+csv.field_size_limit(2**31 - 1)
+
+def load_config(spider):
+    module_name = spider.settings.get("MODEL_MODULE")
+    if not module_name:
+        raise ValueError("MODEL_MODULE is not configured")
+    config = getattr(importlib.import_module(module_name), "PIPELINE_CONFIG", None)
+    if not config:
+        raise ValueError("PIPELINE_CONFIG is missing from " + module_name)
+    return config
+
+
+def output_path(spider, extension):
+    directory = Path(spider.settings.get("EXPORT_DIR"))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "{}.{}".format(spider.name, extension)
+
+
+def is_complex(value):
+    return isinstance(value, (list, tuple, set, dict))
+
+
+def to_json_text(value):
+    if isinstance(value, set):
+        value = list(value)
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def coerce(value, column):
+    """Cast a raw value (spider item, CSV string, JSON, Parquet) to the
+    Python type of a SQLAlchemy column. Lists/dicts become JSON text."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if is_complex(value):
+        value = to_json_text(value)
+
+    try:
+        python_type = column.type.python_type
+    except NotImplementedError:
+        return value
+
+    if python_type is bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "t", "yes")
+    if python_type is int:
+        return value if isinstance(value, int) else int(float(value))
+    if python_type is float:
+        return float(value)
+    if python_type is Decimal:
+        return Decimal(str(value))
+    if python_type is str:
+        return value if isinstance(value, str) else str(value)
+    return value
+
+
+def to_date_string(value):
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if value:
+        text = str(value)
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).strftime(
+                "%Y-%m-%d"
+            )
+        except ValueError:
+            return text[:10]
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def chunked(iterable, size):
+    iterator = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(iterator, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def iter_file_rows(path, chunk_size):
+    """Yield lists of dict rows from a csv / json / parquet file."""
+    path = Path(path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        with open(path, "r", newline="", encoding="utf-8") as file:
+            yield from chunked(csv.DictReader(file), chunk_size)
+    elif suffix == ".json":
+        with open(path, "r", encoding="utf-8") as file:
+            yield from chunked(json.load(file), chunk_size)
+    elif suffix == ".parquet":
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=chunk_size):
+            yield batch.to_pylist()
+    else:
+        raise ValueError("Unsupported file format: " + suffix)
+
+
+def copy_tables(tables, prefix):
+    """Clone SQLAlchemy tables into a fresh MetaData with a name prefix,
+    re-pointing table-level foreign keys at the renamed tables."""
+    metadata = MetaData()
+    copies = {}
+    for table in tables:
+        columns = [column._copy() for column in table.columns]
+        constraints = []
+        for fk in table.foreign_key_constraints:
+            targets = []
+            for element in fk.elements:
+                ref_table, ref_column = element.target_fullname.rsplit(".", 1)
+                targets.append("{}{}.{}".format(prefix, ref_table, ref_column))
+            constraints.append(
+                ForeignKeyConstraint([c.name for c in fk.columns], targets)
+            )
+        copies[table.name] = Table(
+            prefix + table.name, metadata, *columns, *constraints
+        )
+    return copies
+
+
+class ScrapeDatePipeline:
+    def open_spider(self, spider):
+        dates = load_config(spider)["dates"]
+        self.timestamp_column = dates["timestamp_column"]
+        self.initial_column = dates["initial_column"]
+        self.latest_column = dates["latest_column"]
+
+    def process_item(self, item, spider):
+        date = to_date_string(item.get(self.timestamp_column))
+        item[self.initial_column] = date
+        item[self.latest_column] = date
+        return item
+
+class JsonPipeline:
+    def open_spider(self, spider):
+        self.file = open(output_path(spider, "json"), "wb")
+        self.exporter = JsonItemExporter(self.file, encoding="utf-8")
+        self.exporter.start_exporting()
+
+    def process_item(self, item, spider):
+        self.exporter.export_item(item)
+        return item
+
+    def close_spider(self, spider):
+        self.exporter.finish_exporting()
+        self.file.close()
+
+
+class CsvPipeline:
+    def open_spider(self, spider):
+        self.file = open(output_path(spider, "csv"), "wb")
+        self.exporter = CsvItemExporter(self.file, encoding="utf-8")
+        self.exporter.start_exporting()
+
+    def process_item(self, item, spider):
+        # CSV cells are flat text: lists/dicts are stored as JSON text
+        row = {
+            key: to_json_text(value) if is_complex(value) else value
+            for key, value in item.items()
+        }
+        self.exporter.export_item(row)
+        return item
+
+    def close_spider(self, spider):
+        self.exporter.finish_exporting()
+        self.file.close()
+
+
+class ParquetPipeline:
+    def open_spider(self, spider):
+        export_model = load_config(spider).get("export", {}).get("model")
+        self.columns = (
+            {c.name: c for c in export_model.__table__.columns}
+            if export_model is not None
+            else {}
+        )
+        self.path = output_path(spider, "parquet")
+        self.batch_size = max(1, spider.settings.getint("PARQUET_BATCH_SIZE", 500))
+        self.rows = []
+        self.schema = None
+        self.writer = None
+
+    def process_item(self, item, spider):
+        row = {}
+        for key, value in item.items():
+            column = self.columns.get(key)
+            if column is not None:
+                value = coerce(value, column)
+                row[key] = float(value) if isinstance(value, Decimal) else value
+            elif is_complex(value):
+                row[key] = to_json_text(value)
+            elif value is None or isinstance(value, (str, int, float, bool)):
+                row[key] = value
+            else:
+                row[key] = str(value)
+        self.rows.append(row)
+
+        if len(self.rows) >= self.batch_size:
+            self.flush()
+        return item
+
+    def build_schema(self):
+        names = list(dict.fromkeys(key for row in self.rows for key in row))
+        fields = []
+        for name in names:
+            column = self.columns.get(name)
+            if column is not None:
+                arrow_type = self.arrow_type_from_column(column)
+            else:
+                sample = next(
+                    (r[name] for r in self.rows if r.get(name) is not None), None
+                )
+                arrow_type = self.arrow_type_from_value(sample)
+            fields.append(pa.field(name, arrow_type))
+        return pa.schema(fields)
+
+    @staticmethod
+    def arrow_type_from_column(column):
+        try:
+            python_type = column.type.python_type
+        except NotImplementedError:
+            return pa.string()
+        if python_type is bool:
+            return pa.bool_()
+        if python_type is int:
+            return pa.int64()
+        if python_type in (float, Decimal):
+            return pa.float64()
+        return pa.string()
+
+    @staticmethod
+    def arrow_type_from_value(value):
+        if isinstance(value, bool):
+            return pa.bool_()
+        if isinstance(value, int):
+            return pa.int64()
+        if isinstance(value, float):
+            return pa.float64()
+        return pa.string()
+
+    def flush(self):
+        if not self.rows:
+            return
+        if self.schema is None:
+            self.schema = self.build_schema()
+            self.writer = pq.ParquetWriter(str(self.path), self.schema)
+
+        frame = pd.DataFrame(self.rows, columns=self.schema.names)
+        table = pa.Table.from_pandas(frame, schema=self.schema, preserve_index=False)
+        self.writer.write_table(table)
+        self.rows = []
+
+    def close_spider(self, spider):
+        try:
+            self.flush()
+        finally:
+            if self.writer is not None:
+                self.writer.close()
+
+
+class TableWriter:
+    """Builds one INSERT statement for a table from its SQLAlchemy definition.
+
+    insert         plain INSERT
+    insert_ignore  duplicate key -> keep the existing row (first run of the day wins)
+    upsert         duplicate key -> update the row ONLY if the incoming
+                   latest-date is newer than the stored one, so a same-day
+                   rerun changes nothing. The initial-date column is never
+                   touched; the latest-date column moves forward.
+    """
+
+    def __init__(self, table, mode, dates_config=None):
+        if mode not in ("insert", "insert_ignore", "upsert"):
+            raise ValueError("Unknown write mode: " + str(mode))
+
+        dates = dates_config or {}
+        initial = dates.get("initial_column")
+        latest = dates.get("latest_column")
+
+        self.table = table
+        self.mode = mode
+        self.columns = {column.name: column for column in table.columns}
+        self.pk = [column.name for column in table.primary_key.columns]
+
+        statement = mysql_insert(table)
+        if mode == "upsert":
+            guarded = latest in self.columns
+            assignments = []
+            for name in self.columns:
+                if name in self.pk or name in (initial, latest):
+                    continue
+                value = statement.inserted[name]
+                if guarded:
+                    value = func.if_(
+                        table.c[latest] < statement.inserted[latest],
+                        value,
+                        table.c[name],
+                    )
+                assignments.append((name, value))
+            if guarded:
+                # must be LAST: MySQL evaluates assignments left to right
+                assignments.append(
+                    (latest, func.greatest(table.c[latest], statement.inserted[latest]))
+                )
+            statement = statement.on_duplicate_key_update(assignments)
+        elif mode == "insert_ignore":
+            # no-op update: skips the duplicate without hiding other errors
+            first = self.pk[0]
+            statement = statement.on_duplicate_key_update({first: table.c[first]})
+        self.statement = statement
+
+    def build(self, row):
+        values = {
+            name: coerce(row.get(name), column)
+            for name, column in self.columns.items()
+        }
+        if any(values[name] is None for name in self.pk):
+            return None
+        return values
+
+
+class MySQLWriter:
+    """Writes rows (single item or a whole chunk) into an ordered list of
+    tables inside one transaction. One execute per table = executemany."""
+
+    def __init__(self, engine, tables, dates_config=None):
+        self.engine = engine
+        self.tables = [table for table, _ in tables]
+        self.writers = [TableWriter(table, mode, dates_config) for table, mode in tables]
+        # upsert keys already written in this run: no need to rewrite parents
+        self.seen = {w.table.name: set() for w in self.writers if w.mode == "upsert"}
+
+    def create_tables(self):
+        self.tables[0].metadata.create_all(self.engine, tables=self.tables)
+
+    def write_rows(self, rows):
+        newly_seen = {}
+
+        with self.engine.begin() as connection:
+            for writer in self.writers:
+                batch = {}
+                for row in rows:
+                    values = writer.build(row)
+                    if values is None:
+                        logger.warning(
+                            "Skipped row with empty key for table %s", writer.table.name
+                        )
+                        continue
+                    key = tuple(values[name] for name in writer.pk)
+
+                    if writer.mode == "upsert" and key in self.seen[writer.table.name]:
+                        continue
+                    if key in batch:
+                        continue
+                    batch[key] = values
+
+                if batch:
+                    connection.execute(writer.statement, list(batch.values()))
+                    if writer.mode == "upsert":
+                        newly_seen[writer.table.name] = set(batch)
+
+        # only remember keys once the transaction has committed
+        for name, keys in newly_seen.items():
+            self.seen[name] |= keys
+
+
+class MySQLBasePipeline:
+    config_key = None
+
+    def open_spider(self, spider):
+        config = load_config(spider)
+        connection = spider.settings.get("MYSQL_CONNECTION")
+        if not connection:
+            raise ValueError("MYSQL_CONNECTION is not configured")
+
+        tables = [
+            (spec["model"].__table__, spec["mode"])
+            for spec in config[self.config_key]["tables"]
+        ]
+        self.engine = create_engine(connection, pool_pre_ping=True)
+        self.writer = MySQLWriter(self.engine, tables, config.get("dates"))
+        self.writer.create_tables()
+
+    def process_item(self, item, spider):
+        # inserted as it arrives: one transaction per item
+        self.writer.write_rows([dict(item)])
+        return item
+
+    def close_spider(self, spider):
+        self.engine.dispose()
+
+
+class MySQLFlatPipeline(MySQLBasePipeline):
+    config_key = "flat"
+
+
+class MySQLRelationalPipeline(MySQLBasePipeline):
+    config_key = "relational"
+
+
+class FileToMySQLPipeline:
+    """Loads the exported file into a second copy of the relational tables
+    (different database and/or table prefix) using executemany.
+
+    Runs on the spider_closed signal, which Scrapy sends AFTER every pipeline's
+    close_spider, so the CSV/JSON/Parquet file is guaranteed to be complete.
+    """
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        pipeline = cls()
+        crawler.signals.connect(pipeline.spider_closed, signal=signals.spider_closed)
+        return pipeline
+
+    def process_item(self, item, spider):
+        return item
+
+    def spider_closed(self, spider, reason):
+        settings = spider.settings
+        config = load_config(spider)
+
+        file_format = settings.get("MYSQL_FILE_FORMAT", "csv").lower()
+        path = output_path(spider, file_format)
+        if not path.exists():
+            spider.logger.warning("File-to-MySQL: %s not found, nothing loaded", path)
+            return
+
+        main_connection = settings.get("MYSQL_CONNECTION")
+        connection = settings.get("MYSQL_FILE_CONNECTION") or main_connection
+        prefix = settings.get("MYSQL_FILE_TABLE_PREFIX", "") or ""
+        if not connection:
+            raise ValueError("MYSQL_CONNECTION is not configured")
+        if connection == main_connection and not prefix:
+            raise ValueError(
+                "File-to-MySQL needs a different database (MYSQL_FILE_CONNECTION) "
+                "or a MYSQL_FILE_TABLE_PREFIX, otherwise it would write into the "
+                "relational tables"
+            )
+
+        specs = config["relational"]["tables"]
+        originals = [(spec["model"].__table__, spec["mode"]) for spec in specs]
+        copies = copy_tables([table for table, _ in originals], prefix)
+        tables = [(copies[table.name], mode) for table, mode in originals]
+
+        engine = create_engine(connection, pool_pre_ping=True)
+        try:
+            writer = MySQLWriter(engine, tables, config.get("dates"))
+            writer.create_tables()
+
+            total = 0
+            for chunk in iter_file_rows(path, settings.getint("FILE_BATCH_SIZE", 1000)):
+                writer.write_rows(chunk)
+                total += len(chunk)
+
+            spider.logger.info(
+                "File-to-MySQL: loaded %d rows from %s (spider closed: %s)",
+                total, path.name, reason,
+            )
+        finally:
+            engine.dispose()
